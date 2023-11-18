@@ -1,0 +1,4 @@
+RECORD="www"
+DOMAIN="domain.tld"
+USER="username"
+PASSWORD="verylongsecurestring"

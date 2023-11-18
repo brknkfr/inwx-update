@@ -1,0 +1,196 @@
+#!/usr/bin/env sh
+#
+# A small, even minimalistic, yet simple and posix compliant script to update 
+# a zone record using the API of INWX (https://www.inwx.com/en/help/apidoc).
+#
+# Requirements: A posix shell, the command "curl" and "find" (from 
+# package "findutils"). For notifications, you need a working "sendmail" 
+# command.
+# Ideally, this script runs as a cronjob or systemd.timer unit. If the zone 
+# record doesn't exist yet, it gets created.
+# Create a configuration file under /etc/default/inwx-update containing the
+# mandatory variables APIKEY, RECORD and DOMAIN. Adapt the other variables 
+# to your needs. Set UPDATE_MSG to get a notification upon a successful 
+# update.
+#
+# Mandatory variables:
+#RECORD="www"
+#DOMAIN="domain.tld"
+#USER="string"
+#PASSWORD="string"
+# Optional variables:
+#MAIL="notification-email@address"
+#UPDATE_MSG="IP updated for $FQDN." # Message to send upon IP update.
+#TTL="300"
+#API="https://api.domrobot.com/jsonrpc/"
+#IP_SERVICE="https://ifconfig.co"
+
+set -eu
+
+# Get and set variables
+. "/etc/default/inwx-update"
+RECORD=${RECORD:-}
+DOMAIN=${DOMAIN:-}
+USER=${USER:-}
+PASSWORD=${PASSWORD:-}
+MAIL=${MAIL:-$(whoami)}
+UPDATE_MSG=${UPDATE_MSG:-}
+TTL=${TTL:-300}
+API=${API:-https://api.domrobot.com/jsonrpc/}
+IP_SERVICE=${IP_SERVICE:-https://ifconfig.co}
+SILENT="${SILENT:-false}"
+FORCE_UPDATE_DAYS="${FORCE_UPDATE_DAYS:-1}"
+DISABLE_IPV6=${DISABLE_IPV6:-false}
+
+# Script variables
+SCRIPTNAME=$(basename "$0")
+HOSTNAME=$(hostname --long)
+
+# Check mandatory variables
+[ -z "$RECORD" ] && echo "No domain set." && exit 1
+[ -z "$DOMAIN" ] && echo "No record set." && exit 1
+[ -z "$USER" ] && echo "No user set." && exit 1
+[ -z "$PASSWORD" ] && echo "No password set." && exit 1
+! command -v curl >/dev/null && echo "No curl available." && exit 1
+! command -v find >/dev/null && echo "No find available." && exit 1
+
+# Curl args
+CURL_ARGS="--max-timeout 5"
+[ "$SILENT" = "true" ] && CURL_ARGS="$CURL_ARGS --silent --output /dev/null"
+
+# Function variables
+if [ "$RECORD" = "@" ]; then
+	FQDN="$DOMAIN"
+else
+	FQDN="${RECORD}"."${DOMAIN}"
+fi
+CACHE_FILE="/tmp/$SCRIPTNAME-$(echo "$FQDN" | tr -cd '[:alnum:]')"
+NL="
+"
+
+run() {
+	UPDATED="false"
+	ERROR=""
+	IP_VERSIONS="4 6"
+	[ "$DISABLE_IPV6" != "false" ] && IP_VERSIONS="4"
+	[ "active" = "$(systemctl is-active inwx-update.timer)" ] || SILENT="${SILENT:-false}"
+	
+	for VER in $IP_VERSIONS; do
+		if [ "$VER" = "4" ]; then
+			AWK_IP_PATTERN='{match($0,/[0-9]{1,3}+\.[0-9]{1,3}+\.[0-9]{1,3}+\.[0-9]{1,3}+/);print $0}'
+			TYPE="A"
+			IP="" && IP_DNS=""
+		elif [ "$VER" = "6" ]; then
+			AWK_IP_PATTERN='{match($0,/([a-f0-9:]+:+)+[a-f0-9]+/);print $0}'
+			TYPE="AAAA"
+			IP="" && IP_DNS=""
+		fi
+		if get_public_ip; then
+			[ "$SILENT" != "false"  ] || echo "My public IPv$VER address is $IP."
+			if resolve_ip; then
+				[ "$SILENT" != "false"  ] || echo "The host $FQDN is resolving to $IP_DNS."
+				if cache_ip; then
+					if get_record; then
+						if update_ip; then
+							[ "$SILENT" != "false"  ] || echo "Updated $FQDN to IPv$VER address $IP." && UPDATED="true"
+						else
+							ERROR="Could not update IPv$VER address for $FQDN to $IP.$NL$ERROR"
+						fi
+					else
+						if create_record; then
+							[ "$SILENT" != "false" ] || echo "Created DNS entry for $FQDN with IPv$VER address $IP."
+						else
+							ERROR="Could not create DNS entry for $FQDN with IPv$VER $IP.$NL$ERROR"
+						fi
+					fi
+				else
+					[ "$SILENT" != "false" ] || echo "No IPv$VER update needed for host $FQDN."
+				fi
+			else
+				ERROR="Could not resolve IPv$VER address of $FQDN.$NL$ERROR"
+			fi
+		else
+			ERROR="Could not get public IPv$VER address from $IP_SERVICE.$NL$ERROR"
+		fi
+	done
+	notify
+}
+
+get_public_ip() {
+	IP=$(curl -s -"$VER" "$IP_SERVICE" | awk "$AWK_IP_PATTERN" ) && [ -n "$IP" ] || return 1
+}
+
+resolve_ip() {
+	IP_DNS=$(getent ahostsv"$VER" "$FQDN" | awk '{ print $1; exit }') || return 1
+}
+
+cache_ip() {
+	[ -f "$CACHE_FILE"-"$VER" ] && find "$CACHE_FILE-$VER" -type f -mtime +"$FORCE_UPDATE_DAYS" -delete
+	[ ! -f "$CACHE_FILE"-"$VER" ] && echo "$IP" > "$CACHE_FILE"-"$VER"
+	if [ "$(cat "$CACHE_FILE"-"$VER")" != "$IP" ] || [ "$IP_DNS" != "$IP" ]; then
+		echo "$IP" > "$CACHE_FILE"-"$VER"
+	else
+		return 1
+	fi
+}
+
+get_record() {
+	RECORD_CHECK_DATA='{
+		"method":"nameserver.info",
+		"params":{
+			"user":"'$USER'",
+			"pass":"'$PASSWORD'",
+			"domain":"'$DOMAIN'",
+			"name":"'$FQDN'",
+			"type":"'$TYPE'"
+		}
+	}'
+	RECORD_ID=$(curl -s -X POST -H 'Content-Type: application/json' \
+		-d "$RECORD_CHECK_DATA" "$API" |
+		awk 'match($0, /"record":[{"id":[0-9]+/){print substr($0, RSTART+16,  RLENGTH-16)}')
+	[ -n "$RECORD_ID" ] || return 1
+}
+
+create_record() {
+	SET_RECORD_DATA='{
+		"method":"nameserver.createRecord",
+		"params":{
+			"user":"'$USER'",
+			"pass":"'$PASSWORD'",
+			"domain":"'$DOMAIN'",
+			"type":"'$TYPE'",
+			"content":"'$IP'",
+			"name":"'$FQDN'",
+			"ttl":"'$TTL'"
+		}
+	}'
+	curl "$CURL_ARGS" -X POST -H 'Content-Type: application/json' \
+		-d "$SET_RECORD_DATA" "$API" || return 1
+}
+
+update_ip() {
+	SET_RECORD_DATA='{
+		"method":"nameserver.updateRecord",
+		"params":{
+			"user":"'$USER'",
+			"pass":"'$PASSWORD'",
+			"id":"'$RECORD_ID'",
+			"name":"'$FQDN'",
+			"content":"'$IP'",
+			"ttl":"'$TTL'"
+		}
+	}'
+	curl "$CURL_ARGS" -X POST -H 'Content-Type: application/json' \
+		-d "$SET_RECORD_DATA" "$API" || return 1
+}
+
+notify() {
+	[ -n "$ERROR" ] && echo "$ERROR"
+	if [ -n "$MAIL" ] && command -v sendmail > /dev/null && [ -n "$ERROR" ]; then
+		echo "To: $MAIL${NL}Subject: [$SCRIPTNAME] IP address error for $FQDN on $HOSTNAME$NL$NL$ERROR" | sendmail -t
+	elif [ "$UPDATED" != "false" ] && [ -n "$UPDATE_MSG" ]; then
+		echo "To: $MAIL${NL}Subject: [$SCRIPTNAME] IP address updated for $FQDN on $HOSTNAME$NL$NL$UPDATE_MSG" | sendmail -t
+	fi
+}
+
+run
