@@ -24,10 +24,13 @@
 #TTL="300"
 #API="https://api.domrobot.com/jsonrpc/"
 #IP_SERVICE="https://ifconfig.co"
+#CURL_ARGS="" # curl arguments for updating IP address to $IP_SERVICE
+#INTERFACE="" # network interface to get public IP address
 
 set -eu
 
 # Get and set variables
+#shellcheck disable=SC1091
 . "/etc/default/inwx-update"
 RECORD=${RECORD:-}
 DOMAIN=${DOMAIN:-}
@@ -38,6 +41,8 @@ UPDATE_MSG=${UPDATE_MSG:-}
 TTL=${TTL:-300}
 API=${API:-https://api.domrobot.com/jsonrpc/}
 IP_SERVICE=${IP_SERVICE:-https://ifconfig.co}
+CURL_ARGS=${CURL_ARGS:--m 5}
+INTERFACE=${INTERFACE:-}
 SILENT="${SILENT:-false}"
 FORCE_UPDATE_DAYS="${FORCE_UPDATE_DAYS:-1}"
 DISABLE_IPV6=${DISABLE_IPV6:-false}
@@ -54,8 +59,7 @@ HOSTNAME=$(hostname --long)
 ! command -v curl >/dev/null && echo "No curl available." && exit 1
 ! command -v find >/dev/null && echo "No find available." && exit 1
 
-# Curl args
-CURL_ARGS="-m 5"
+# Silent
 [ "$SILENT" = "true" ] && CURL_ARGS="$CURL_ARGS -s -o /dev/null"
 
 # Function variables
@@ -117,7 +121,11 @@ run() {
 }
 
 get_public_ip() {
-	IP=$(curl -s -"$VER" "$IP_SERVICE" | awk "$AWK_IP_PATTERN" ) && [ -n "$IP" ] || return 1
+	if [ -n "$INTERFACE" ]; then
+		CURL_INTERFACE_ARG="--interface $INTERFACE"
+	fi
+	#shellcheck disable=SC2086
+	IP=$(curl -s $CURL_INTERFACE_ARG -"$VER" "$IP_SERVICE" | awk "$AWK_IP_PATTERN" ) && [ -n "$IP" ] || return 1
 }
 
 resolve_ip() {
@@ -194,3 +202,4 @@ notify() {
 }
 
 run
+
